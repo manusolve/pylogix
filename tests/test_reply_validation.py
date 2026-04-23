@@ -254,6 +254,109 @@ class TestParseMultiReadResponse(unittest.TestCase):
             self.assertEqual(status, 0)
 
 
+class TestDataTypeMismatchGuard(unittest.TestCase):
+    """
+    Tests for the data_type cross-check guard in _parse_multi_read_response.
+
+    This simulates the production scenario where a stale MSP reply (containing
+    STRING segments for a previous batch) arrives in response to a request for
+    DINT tags.  Before this guard existed, my string-decode fallback would
+    correctly decode the STRING content but return it under the *wrong* tag
+    (e.g. `sequence` would receive 'abnormal condition - B to reset').
+    """
+
+    def setUp(self):
+        self.plc = _make_plc()
+        # Pre-populate KnownTags with DINT types for all four tags,
+        # simulating that _initial_read already ran successfully.
+        for tag, _, _ in TAGS_4:
+            from pylogix.eip import parse_tag_name
+            _, base_tag, _ = parse_tag_name(tag)
+            self.plc.KnownTags[base_tag] = (0xC4, 4)  # DINT
+
+    def _build_stale_string_msp(self, strings):
+        """Build a valid MSP reply containing STRING sub-replies for each item in strings."""
+        def _string_segment(text):
+            encoded = text.encode('utf-8')[:82]
+            content = pack('<I', len(encoded)) + encoded + b'\x00' * (82 - len(encoded))
+            # CIP sub-reply: service=0xCC, reserved, status=0, ext=0,
+            #   data_type=0xa0, struct_id=0x1234 (custom, != 0x0fce), content
+            return (pack('<BBBB', 0xCC, 0x00, 0x00, 0x00) +
+                    pack('<H', 0xa0) +
+                    pack('<H', 0x1234) +  # non-standard struct_id
+                    content)
+
+        segments = [_string_segment(s) for s in strings]
+        n = len(segments)
+        seg_size = len(segments[0])
+        base_offset = 2 + n * 2   # after service_count (2) + offsets (n*2)
+        offsets = [base_offset + i * seg_size for i in range(n)]
+
+        msp_payload = pack('<H', n)
+        for off in offsets:
+            msp_payload += pack('<H', off)
+        for seg in segments:
+            msp_payload += seg
+
+        inner = (pack('<IH', 0, 0) +
+                 pack('<H', 2) +
+                 pack('<HHI', 0x00A1, 4, 0x0000B5A7) +
+                 pack('<HH', 0x00B1, 2 + 4 + len(msp_payload)) +
+                 pack('<H', 0x0001) +
+                 pack('<BBBB', 0x8A, 0x00, 0x00, 0x00) +
+                 msp_payload)
+        eip_hdr = (pack('<HH', 0x0070, len(inner)) +
+                   pack('<I', 0x400003ED) +
+                   pack('<I', 0) +
+                   pack('<Q', 0) +
+                   pack('<I', 0))
+        return eip_hdr + inner
+
+    def test_stale_string_reply_does_not_produce_str_for_dint_tag(self):
+        """Stale STRING segments must not return str values for DINT-cached tags."""
+        raw = self._build_stale_string_msp(['', '', 'abnormal condition', '88.9 Flare '])
+        result = self.plc._parse_multi_read_response(raw, TAGS_4)
+        self.assertEqual(len(result), 4)
+        for tag_name, value, status in result:
+            self.assertIsNone(value, msg="Expected None for mismatched tag '%s'" % tag_name)
+            self.assertIsInstance(status, str)
+            self.assertIn("mismatch", status)
+
+    def test_stale_reply_invalidates_known_tags_cache(self):
+        """After a mismatch the cache entry must be removed so next read re-discovers type."""
+        raw = self._build_stale_string_msp(['', '', 'x', 'y'])
+        self.plc._parse_multi_read_response(raw, TAGS_4)
+        from pylogix.eip import parse_tag_name
+        for tag, _, _ in TAGS_4:
+            _, base_tag, _ = parse_tag_name(tag)
+            self.assertNotIn(
+                base_tag, self.plc.KnownTags,
+                msg="KnownTags should be invalidated for '%s'" % base_tag)
+
+    def test_correct_dint_reply_still_works_with_known_tags(self):
+        """Happy path must still succeed when cached type matches segment type."""
+        result = self.plc._parse_multi_read_response(RAW_HAPPY, TAGS_4)
+        self.assertEqual(len(result), 4)
+        values = [v for _, v, _ in result]
+        self.assertEqual(values, [1, 2, 3, 4])
+        for _, value, status in result:
+            self.assertEqual(status, 0)
+
+    def test_first_read_without_cache_still_works(self):
+        """When a tag has no cache entry the check is skipped (first-ever read)."""
+        # Clear the cache
+        self.plc.KnownTags.clear()
+        result = self.plc._parse_multi_read_response(RAW_HAPPY, TAGS_4)
+        self.assertEqual(len(result), 4)
+        self.assertEqual([v for _, v, _ in result], [1, 2, 3, 4])
+        # Cache must now be populated
+        from pylogix.eip import parse_tag_name
+        for tag, _, _ in TAGS_4:
+            _, base_tag, _ = parse_tag_name(tag)
+            self.assertIn(base_tag, self.plc.KnownTags)
+
+
+
 class TestValidateReply(unittest.TestCase):
     """Unit tests for Connection._validate_reply."""
 

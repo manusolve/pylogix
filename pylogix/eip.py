@@ -1718,6 +1718,27 @@ class PLC(object):
                 if status == 0:
                     data_type = unpack_from("<B", segment, 4)[0]
 
+                    # Cross-validate data_type against the cached type.
+                    # All tags should already be in KnownTags via
+                    # _get_unknown_types → _initial_read before we reach here.
+                    # A mismatch means this segment almost certainly belongs to
+                    # a stale reply for a different batch (e.g. a STRING batch
+                    # arriving in response to a DINT batch after a CIP desync /
+                    # reconnect).  Fail this tag cleanly and invalidate the
+                    # cache so the next poll re-discovers the correct type.
+                    if base_tag in self.KnownTags:
+                        cached_dtype = self.KnownTags[base_tag][0]
+                        if cached_dtype != data_type:
+                            del self.KnownTags[base_tag]
+                            response = [
+                                tag_name, None,
+                                "segment data_type mismatch: "
+                                "cached 0x%02x, got 0x%02x" % (
+                                    cached_dtype, data_type),
+                            ]
+                            reply.append(response)
+                            continue
+
                     # get the number of byte the value occupies
                     if data_type == 0xa0:
                         data_len = len(segment[8:])
