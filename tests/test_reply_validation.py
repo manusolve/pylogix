@@ -332,5 +332,180 @@ class TestVersion(unittest.TestCase):
         self.assertIn("manusolve", pylogix.__version__)
 
 
-if __name__ == '__main__':
-    unittest.main()
+# ---------------------------------------------------------------------------
+# Helper: build a minimal single-tag connected reply with struct (0xa0) type
+# ---------------------------------------------------------------------------
+def _build_single_struct_reply(struct_id_bytes: bytes, struct_content: bytes) -> bytes:
+    """
+    Build a minimal connected EIP reply for a single ReadTag of a struct type.
+    Layout matches what _read_tag → _get_values sees:
+      bytes  0-23: EIP encap header (command 0x70)
+      bytes 24-29: interface handle + timeout
+      bytes 30-31: item count = 2
+      bytes 32-39: item1 (0xA1, len=4, conn ID)
+      bytes 40-43: item2 header (0xB1, len)
+      bytes 44-45: CPF seq
+      byte  46:    CIP reply service (0xCC = ReadTag reply)
+      bytes 47-49: CIP reserved, status, ext_status_size
+      bytes 50-51: data_type (0xa0 = struct)
+      bytes 52-53: struct_id
+      bytes 54+:   struct content
+    """
+    cip_payload = (
+        pack('<BB', 0xa0, 0x00) +   # data_type = struct
+        struct_id_bytes[:2] +        # struct_id (2 bytes)
+        struct_content               # struct content
+    )
+    cip_hdr    = pack('<BBBB', 0xCC, 0x00, 0x00, 0x00)  # ReadTag reply, status 0
+    cpf_seq    = pack('<H', 0x0001)
+    item2_len  = pack('<H', 2 + 4 + len(cip_payload))   # seq + cip_hdr + payload
+
+    item1      = pack('<HHI', 0x00A1, 0x0004, 0x0000B5A7)
+    item2_hdr  = pack('<H', 0x00B1) + item2_len
+    inner      = (pack('<IH', 0, 0) +        # interface handle, timeout
+                  pack('<H', 2) +             # item count
+                  item1 +
+                  item2_hdr + cpf_seq + cip_hdr + cip_payload)
+    eip_hdr    = (pack('<H', 0x0070) +
+                  pack('<H', len(inner)) +
+                  pack('<I', 0x400003ED) +   # session handle
+                  pack('<I', 0) +            # status
+                  pack('<Q', 0) +            # context
+                  pack('<I', 0))             # options
+    return eip_hdr + inner
+
+
+# Helper: build a single-tag struct sub-reply segment for _parse_multi_read_response
+def _build_struct_segment(struct_id: int, struct_content: bytes) -> bytes:
+    """Return a CIP sub-reply segment for a struct tag."""
+    return (
+        pack('<BBBB', 0xCC, 0x00, 0x00, 0x00) +  # CIP reply service, status=0
+        pack('<H', 0xa0) +                          # data_type = struct
+        pack('<H', struct_id) +                     # struct_id
+        struct_content
+    )
+
+
+def _build_std_string_content(text: str, encoding: str = 'utf-8') -> bytes:
+    """Standard Logix STRING on-wire: 4-byte length + 82 bytes zero-padded data."""
+    encoded = text.encode(encoding)[:82]
+    return pack('<I', len(encoded)) + encoded + b'\x00' * (82 - len(encoded))
+
+
+class TestCustomStringUDTDecode(unittest.TestCase):
+    """
+    Tests that structs with non-standard struct_ids are decoded as strings
+    when they follow the same length-prefixed wire format (custom STRING UDTs).
+    """
+
+    def setUp(self):
+        self.plc = _make_plc()
+        self.plc.KnownTags['Program:ModeAuto'] = (0xa0, 88)
+
+    # ------------------------------------------------------------------
+    # _parse_multi_read_response path (batch reads)
+    # ------------------------------------------------------------------
+    def _run_batch_one_struct(self, struct_id, struct_content, expected_value):
+        """Send a 1-tag batch with a single struct sub-reply."""
+        tag = [("Program:ModeAuto.message", 1, None)]
+        segment = _build_struct_segment(struct_id, struct_content)
+        # Build minimal 50-byte preamble + MSP for 1 tag
+        msp_service_count = pack('<H', 1)
+        msp_offset        = pack('<H', 2 + 1*2)   # offset[0] = 4
+        msp_payload       = msp_service_count + msp_offset + segment
+
+        inner_data = (
+            pack('<IH', 0, 0) +
+            pack('<H', 2) +
+            pack('<HHI', 0x00A1, 0x0004, 0) +
+            pack('<HH', 0x00B1, 2 + 4 + len(msp_payload)) +
+            pack('<H', 0x0001) +
+            pack('<BBBB', 0x8A, 0x00, 0x00, 0x00) +
+            msp_payload
+        )
+        raw = (
+            pack('<H', 0x0070) +
+            pack('<H', len(inner_data)) +
+            pack('<I', 0x400003ED) +
+            pack('<I', 0) +
+            pack('<Q', 0) +
+            pack('<I', 0) +
+            inner_data
+        )
+        result = self.plc._parse_multi_read_response(raw, tag)
+        self.assertEqual(len(result), 1)
+        tag_name, value, status = result[0]
+        self.assertEqual(value, expected_value)
+        self.assertEqual(status, 0)
+
+    def test_standard_string_id_decoded(self):
+        """Sanity: struct_id == StringID (0x0fce) always decodes to str."""
+        content = _build_std_string_content("hello")
+        self._run_batch_one_struct(0x0fce, content, "hello")
+
+    def test_custom_string_udt_decoded_as_str(self):
+        """Custom struct_id but standard wire format → decoded as str."""
+        content = _build_std_string_content("world")
+        self._run_batch_one_struct(0x1234, content, "world")
+
+    def test_custom_string_empty(self):
+        """Custom UDT with empty string (length=0)."""
+        content = _build_std_string_content("")
+        self._run_batch_one_struct(0xABCD, content, "")
+
+    def test_garbage_struct_falls_back_to_bytes(self):
+        """If name_length would exceed segment bounds → falls back to bytes."""
+        # name_length = 9999 far exceeds segment size
+        bad_content = pack('<I', 9999) + b'\x41' * 10
+        tag = [("Program:ModeAuto.message", 1, None)]
+        segment = _build_struct_segment(0x1234, bad_content)
+        msp_service_count = pack('<H', 1)
+        msp_offset        = pack('<H', 4)
+        msp_payload = msp_service_count + msp_offset + segment
+        inner_data = (
+            pack('<IH', 0, 0) + pack('<H', 2) +
+            pack('<HHI', 0x00A1, 4, 0) +
+            pack('<HH', 0x00B1, 2 + 4 + len(msp_payload)) +
+            pack('<H', 1) +
+            pack('<BBBB', 0x8A, 0, 0, 0) +
+            msp_payload
+        )
+        raw = (pack('<H', 0x70) + pack('<H', len(inner_data)) +
+               pack('<I', 0x400003ED) + pack('<I', 0) +
+               pack('<Q', 0) + pack('<I', 0) + inner_data)
+        result = self.plc._parse_multi_read_response(raw, tag)
+        _, value, status = result[0]
+        self.assertIsInstance(value, (bytes, bytearray))
+
+    # ------------------------------------------------------------------
+    # _get_values path (single-tag reads via _read_tag)
+    # ------------------------------------------------------------------
+    def _call_get_values(self, struct_id: int, struct_content: bytes):
+        """Directly exercise _get_values for a struct tag."""
+        # parse_tag_name('ModeAuto.message') returns base_tag='ModeAuto.message'
+        self.plc.KnownTags['ModeAuto.message'] = (0xa0, 88)
+        # Build data as _read_tag sees it (ret_data[50:]):
+        #   [0:2]  = data_type (0xa0)
+        #   [2:4]  = struct_id
+        #   [4:]   = struct content
+        data = pack('<BB', 0xa0, 0x00) + pack('<H', struct_id) + struct_content
+        return self.plc._get_values('ModeAuto.message', data)
+
+    def test_get_values_standard_string_id(self):
+        content = _build_std_string_content("abc")
+        values = self._call_get_values(0x0fce, content)
+        self.assertEqual(values, ["abc"])
+
+    def test_get_values_custom_string_id_decoded(self):
+        content = _build_std_string_content("custom")
+        values = self._call_get_values(0xDEAD, content)
+        self.assertEqual(values, ["custom"])
+
+    def test_get_values_garbage_falls_back_to_bytes(self):
+        bad_content = pack('<I', 50000) + b'\x00' * 4
+        values = self._call_get_values(0xDEAD, bad_content)
+        self.assertEqual(len(values), 1)
+        self.assertIsInstance(values[0], (bytes, bytearray))
+
+
+

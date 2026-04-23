@@ -1486,6 +1486,18 @@ class PLC(object):
         if data_type == 0xa0:
             tmp = unpack_from('<h', data, 2)[0]
             if tmp != self.StringID:
+                # Custom string UDTs share the same on-wire layout as the standard
+                # STRING type (4-byte length prefix + string content).  Try to
+                # decode before falling back to raw bytes.
+                try:
+                    name_len = unpack_from('<L', data, 4)[0]
+                    if 0 <= name_len <= len(data) - 8:
+                        s = data[8:8 + name_len]
+                        values.append(str(s.decode(self.StringEncoding)))
+                        self.Offset += len(data)
+                        return values
+                except (struct_error, UnicodeDecodeError):
+                    pass
                 d = data[4:4 + len(data)]
                 values.append(d)
                 self.Offset += len(data)
@@ -1720,7 +1732,17 @@ class PLC(object):
                             name_length = unpack_from("<I", segment, 8)[0]
                             value = segment[12:12+name_length].decode(self.StringEncoding)
                         else:
-                            value = segment[12:12+data_len]
+                            # Custom string UDTs share the same on-wire layout as
+                            # the standard STRING type.  Try to decode before
+                            # falling back to raw bytes.
+                            try:
+                                name_length = unpack_from("<I", segment, 8)[0]
+                                if 0 <= name_length <= len(segment) - 12:
+                                    value = segment[12:12+name_length].decode(self.StringEncoding)
+                                else:
+                                    value = segment[12:12+data_len]
+                            except (struct_error, UnicodeDecodeError):
+                                value = segment[12:12+data_len]
                     elif data_type == 0xd3 or bit_of_word(tag_name):
                         type_fmt = self.CIPTypes[data_type][2]
                         value = unpack_from(type_fmt, segment, 6)[0]
