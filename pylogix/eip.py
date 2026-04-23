@@ -27,7 +27,7 @@ from .lgx_response import Response
 from .lgx_tag import Tag, UDT
 from .utils import is_micropython
 from random import randrange
-from struct import pack, unpack_from
+from struct import pack, unpack_from, error as struct_error
 
 
 if not is_micropython():
@@ -1486,6 +1486,18 @@ class PLC(object):
         if data_type == 0xa0:
             tmp = unpack_from('<h', data, 2)[0]
             if tmp != self.StringID:
+                # Custom string UDTs share the same on-wire layout as the standard
+                # STRING type (4-byte length prefix + string content).  Try to
+                # decode before falling back to raw bytes.
+                try:
+                    name_len = unpack_from('<L', data, 4)[0]
+                    if 0 <= name_len <= len(data) - 8:
+                        s = data[8:8 + name_len]
+                        values.append(str(s.decode(self.StringEncoding)))
+                        self.Offset += len(data)
+                        return values
+                except (struct_error, UnicodeDecodeError):
+                    pass
                 d = data[4:4 + len(data)]
                 values.append(d)
                 self.Offset += len(data)
@@ -1646,13 +1658,48 @@ class PLC(object):
 
         return ret[bit_pos:bit_pos + count]
 
+    def _fail_batch(self, tags, reason):
+        """Return a per-tag failure list for _parse_multi_read_response."""
+        return [[tags[i][0], None, reason] for i in range(len(tags))]
+
     def _parse_multi_read_response(self, data, tags):
         """
         Extract the values from the multi-service message reply
         """
+        # Validate the CIP reply service before stripping the header.
+        # A healthy MSP reply has service byte 0x8A (0x0A | 0x80) at offset 46.
+        if len(data) < 47:
+            return self._fail_batch(tags, "MSP reply too short for CIP service check")
+        cip_service = data[46]
+        if cip_service != 0x8A:
+            return self._fail_batch(
+                tags,
+                "MSP expected CIP service 0x8A, got 0x%02x" % cip_service)
+
         data = data[50:]
+
+        if len(data) < 2:
+            return self._fail_batch(tags, "MSP reply too short for service_count")
+
         service_count = unpack_from("<H", data, 0)[0]
+
+        if service_count != len(tags):
+            return self._fail_batch(
+                tags,
+                "MSP service_count=%d != requested=%d" % (service_count, len(tags)))
+
+        needed = 2 + service_count * 2
+        if len(data) < needed:
+            return self._fail_batch(
+                tags,
+                "MSP truncated: need %d bytes for offsets, have %d" % (needed, len(data)))
+
         offsets = [unpack_from("<H", data, i*2+2)[0] for i in range(service_count)]
+
+        for off in offsets:
+            if off >= len(data):
+                return self._fail_batch(
+                    tags, "MSP offset %d out of range (%d)" % (off, len(data)))
 
         # define the start/end offsets so we can extract the values
         segment_bounds = [offset for offset in offsets]
@@ -1665,44 +1712,80 @@ class PLC(object):
 
         reply = []
         for i, segment in enumerate(data_segments):
-            status = unpack_from("<B", segment, 2)[0]
-            tag_name, base_tag, index  = parse_tag_name(tags[i][0])
-            if status == 0:
-                data_type = unpack_from("<B", segment, 4)[0]
+            try:
+                status = unpack_from("<B", segment, 2)[0]
+                tag_name, base_tag, index  = parse_tag_name(tags[i][0])
+                if status == 0:
+                    data_type = unpack_from("<B", segment, 4)[0]
 
-                # get the number of byte the value occupies
-                if data_type == 0xa0:
-                    data_len = len(segment[8:])
-                else:
-                    data_len = len(segment[6:])
+                    # Cross-validate data_type against the cached type.
+                    # All tags should already be in KnownTags via
+                    # _get_unknown_types → _initial_read before we reach here.
+                    # A mismatch means this segment almost certainly belongs to
+                    # a stale reply for a different batch (e.g. a STRING batch
+                    # arriving in response to a DINT batch after a CIP desync /
+                    # reconnect).  Fail this tag cleanly and invalidate the
+                    # cache so the next poll re-discovers the correct type.
+                    if base_tag in self.KnownTags:
+                        cached_dtype = self.KnownTags[base_tag][0]
+                        if cached_dtype != data_type:
+                            del self.KnownTags[base_tag]
+                            response = [
+                                tag_name, None,
+                                "segment data_type mismatch: "
+                                "cached 0x%02x, got 0x%02x" % (
+                                    cached_dtype, data_type),
+                            ]
+                            reply.append(response)
+                            continue
 
-                self.KnownTags[base_tag] = (data_type, data_len)
-                # extract the value from the segment
-                if data_type == 0xa0:
-                    struct_id = unpack_from("<H", segment, 6)[0]
-                    if struct_id == self.StringID:
-                        name_length = unpack_from("<I", segment, 8)[0]
-                        value = segment[12:12+name_length].decode(self.StringEncoding)
+                    # get the number of byte the value occupies
+                    if data_type == 0xa0:
+                        data_len = len(segment[8:])
                     else:
-                        value = segment[12:12+data_len]
-                elif data_type == 0xd3 or bit_of_word(tag_name):
-                    type_fmt = self.CIPTypes[data_type][2]
-                    value = unpack_from(type_fmt, segment, 6)[0]
-                    value = self._words_to_bits(tag_name, [value], 1)[0]
-                elif data_type == 0xc1 and is_micropython():
-                    type_fmt = "b"
-                    value = unpack_from(type_fmt, segment, 6)[0]
-                    if value == 1:
-                        value = True
-                    else:
-                        value = False
-                else:
-                    type_fmt = self.CIPTypes[data_type][2]
-                    value = unpack_from(type_fmt, segment, 6)[0]
-            else:
-                value = None
+                        data_len = len(segment[6:])
 
-            response = [tag_name, value, status]
+                    self.KnownTags[base_tag] = (data_type, data_len)
+                    # extract the value from the segment
+                    if data_type == 0xa0:
+                        struct_id = unpack_from("<H", segment, 6)[0]
+                        if struct_id == self.StringID:
+                            name_length = unpack_from("<I", segment, 8)[0]
+                            value = segment[12:12+name_length].decode(self.StringEncoding)
+                        else:
+                            # Custom string UDTs share the same on-wire layout as
+                            # the standard STRING type.  Try to decode before
+                            # falling back to raw bytes.
+                            try:
+                                name_length = unpack_from("<I", segment, 8)[0]
+                                if 0 <= name_length <= len(segment) - 12:
+                                    value = segment[12:12+name_length].decode(self.StringEncoding)
+                                else:
+                                    value = segment[12:12+data_len]
+                            except (struct_error, UnicodeDecodeError):
+                                value = segment[12:12+data_len]
+                    elif data_type == 0xd3 or bit_of_word(tag_name):
+                        type_fmt = self.CIPTypes[data_type][2]
+                        value = unpack_from(type_fmt, segment, 6)[0]
+                        value = self._words_to_bits(tag_name, [value], 1)[0]
+                    elif data_type == 0xc1 and is_micropython():
+                        type_fmt = "b"
+                        value = unpack_from(type_fmt, segment, 6)[0]
+                        if value == 1:
+                            value = True
+                        else:
+                            value = False
+                    else:
+                        type_fmt = self.CIPTypes[data_type][2]
+                        value = unpack_from(type_fmt, segment, 6)[0]
+                else:
+                    value = None
+
+                response = [tag_name, value, status]
+            except (struct_error, IndexError, KeyError, UnicodeDecodeError):
+                tag_name = tags[i][0]
+                response = [tag_name, None, "MSP sub-reply decode error"]
+
             reply.append(response)
 
         return reply
