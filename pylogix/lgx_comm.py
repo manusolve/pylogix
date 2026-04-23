@@ -69,8 +69,7 @@ class Connection(object):
         """
         if connected:
             eip_header = self._build_eip_header(request)
-            # Record expected reply: CPF seq sent (pre-increment) and CIP reply service.
-            self._last_sent_cpf_seq = (self._sequence_counter - 1) % 0x10000
+            # Record the expected CIP reply service (request service | 0x80).
             self._last_sent_cip_service = (request[0] | 0x80) if request else None
         else:
             if self.parent.Route or slot is not None:
@@ -748,6 +747,8 @@ class Connection(object):
         eip_sequence = self._sequence_counter
         self._sequence_counter += 1
         self._sequence_counter = self._sequence_counter % 0x10000
+        # Store the sequence number actually sent for reply validation.
+        self._last_sent_cpf_seq = eip_sequence
 
         packet = pack('<HHIIQIIHHHHIHHH',
                       eip_command,

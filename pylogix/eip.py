@@ -27,7 +27,7 @@ from .lgx_response import Response
 from .lgx_tag import Tag, UDT
 from .utils import is_micropython
 from random import randrange
-from struct import pack, unpack_from
+from struct import pack, unpack_from, error as struct_error
 
 
 if not is_micropython():
@@ -1739,7 +1739,7 @@ class PLC(object):
                     value = None
 
                 response = [tag_name, value, status]
-            except Exception:
+            except (struct_error, IndexError, KeyError, UnicodeDecodeError):
                 tag_name = tags[i][0]
                 response = [tag_name, None, "MSP sub-reply decode error"]
 

@@ -233,7 +233,8 @@ class TestParseMultiReadResponse(unittest.TestCase):
         result = self.plc._parse_multi_read_response(RAW_2, TAGS_4)
         for tag_name, value, status in result:
             self.assertIsInstance(status, str)
-            self.assertIn("10", status)   # reports the mismatch counts
+            self.assertIn("10", status)   # reports the received count
+            self.assertIn("4", status)    # reports the expected count
 
     # ------------------------------------------------------------------
     # Happy path: valid 4-DINT MSP reply
