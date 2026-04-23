@@ -23,6 +23,9 @@ from struct import pack, unpack_from
 from pylogix.utils import is_micropython
 
 
+class _StaleReplyError(Exception):
+    """Reply does not match the request that was just sent."""
+
 
 # noinspection PyMethodMayBeStatic
 class Connection(object):
@@ -50,6 +53,8 @@ class Connection(object):
         self._session_handle = 0x0000
         self._sequence_counter = 1
         self._vendor_id = 0x1337
+        self._last_sent_cpf_seq = None
+        self._last_sent_cip_service = None
 
     def connect(self, connected=True):
         """
@@ -64,6 +69,9 @@ class Connection(object):
         """
         if connected:
             eip_header = self._build_eip_header(request)
+            # Record expected reply: CPF seq sent (pre-increment) and CIP reply service.
+            self._last_sent_cpf_seq = (self._sequence_counter - 1) % 0x10000
+            self._last_sent_cip_service = (request[0] | 0x80) if request else None
         else:
             if self.parent.Route or slot is not None:
                 path = self._unconnected_path(slot)
@@ -196,6 +204,11 @@ class Connection(object):
             ret_data = self.receive_data()
             if ret_data:
                 if connected:
+                    try:
+                        self._validate_reply(ret_data)
+                    except _StaleReplyError as e:
+                        self._drain_socket()
+                        return 'stale reply: {}'.format(str(e)), None
                     status = unpack_from('<B', ret_data, 48)[0]
                 else:
                     status = unpack_from('<B', ret_data, 42)[0]
@@ -210,6 +223,56 @@ class Connection(object):
         except IOError:
             self.SocketConnected = False
             return 7, None
+
+    def _validate_reply(self, reply):
+        """
+        Check that a connected reply belongs to the last request we sent.
+
+        Raises _StaleReplyError when:
+          - The reply is too short to contain CPF/CIP fields.
+          - The CPF Connected Data Item sequence number does not match what was sent.
+          - The CIP reply service byte does not match (request_service | 0x80).
+
+        For connected EIP SendUnitData (command 0x70) replies, the fixed layout is:
+          bytes 44-45: CPF Connected Data Item sequence counter
+          byte  46   : CIP reply service
+        """
+        if self._last_sent_cpf_seq is None or self._last_sent_cip_service is None:
+            return
+
+        if len(reply) < 47:
+            raise _StaleReplyError("reply too short (%d bytes) for CPF/CIP validation" % len(reply))
+
+        cpf_seq = unpack_from("<H", reply, 44)[0]
+        if cpf_seq != self._last_sent_cpf_seq:
+            raise _StaleReplyError(
+                "CPF seq mismatch: got 0x%04x, expected 0x%04x" % (cpf_seq, self._last_sent_cpf_seq))
+
+        cip_service = reply[46]
+        if cip_service != self._last_sent_cip_service:
+            raise _StaleReplyError(
+                "CIP service mismatch: got 0x%02x, expected 0x%02x" % (cip_service, self._last_sent_cip_service))
+
+    def _drain_socket(self, max_ms=50):
+        """
+        Discard any unread bytes so a stale reply cannot poison the next read.
+        """
+        if self.Socket is None:
+            return
+        old_to = self.Socket.gettimeout()
+        self.Socket.settimeout(max_ms / 1000.0)
+        try:
+            while True:
+                chunk = self.Socket.recv(4096)
+                if not chunk:
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                self.Socket.settimeout(old_to)
+            except Exception:
+                pass
 
     def receive_data(self):
         """
